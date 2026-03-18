@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memscope"
+version = "0.1.0"
+description = "Train memory and tensor shape analyzer"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml", 
+    "rich"
+]
+
+[tool.setuptools.packages.find]
+include = ["memscope*"]

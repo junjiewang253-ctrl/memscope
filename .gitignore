@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+outputs/
+*.json
+*.yaml
+*.yml
+!configs/*.json
+!configs/*.yaml
+!configs/*.yml
+*.pickle
+*.pt
+*.log
+*.egg-info/

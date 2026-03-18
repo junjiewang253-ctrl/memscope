@@ -1,0 +1,24 @@
+{
+  "model": {
+    "model_type": "llama",
+    "num_layers": 1,
+    "hidden_size": 8192,
+    "num_attention_heads": 64,
+    "num_kv_heads": 64,
+    "ffn_hidden_size": 28672,
+    "vocab_size": 32000,
+    "seq_len": 2048
+  },
+  "train": {
+    "micro_batch_size": 1,
+    "grad_accum_steps": 1,
+    "tensor_parallel": 4,
+    "pipeline_parallel": 1,
+    "data_parallel": 1,
+    "zero_stage": 1,
+    "dtype": "bf16",
+    "optimizer": "adamw",
+    "activation_checkpointing": false,
+    "reduce_bucket_size": 500000000
+  }
+}
