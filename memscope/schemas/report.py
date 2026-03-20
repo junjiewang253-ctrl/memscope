@@ -84,7 +84,9 @@ class RuntimeEvent:
     
     # --- 衍生指标 (自动计算) ---
     max_mem_allocated: int = 0     # 历史最大分配显存 (可用于追踪全局峰值)
+    max_mem_reserved: int = 0
     delta_allocated: int = 0       # 净增量 = allocated_after - allocated_before
+    delta_reserved: int = 0
 
     # 记录该事件涉及的具体 Tensor 信息，用于深度分析“是谁占用了显存”
     inputs: List[RuntimeTensorInfo] = field(default_factory=list)  # 输入张量列表
@@ -114,7 +116,8 @@ class RuntimeReport:
     # 时间序列的事件列表: 按时间顺序记录所有 RuntimeEvent, 可以画出 "显存随时间变化曲线"，直观看到哪里出现了尖峰
     runtime_trace: List[RuntimeEvent] = field(default_factory=list)
 
-    peak: RuntimePeak = field(default_factory=dict)
+    peak: RuntimePeak = field(default_factory=RuntimePeak)
+    top_events: List[RuntimeEvent] = field(default_factory=list)
 
     # 运行时环境元数据, 示例：{"gpu_type": "A100", "cuda_version": "12.1", "pytorch_version": "2.5"}
     metadata: Dict[str, str] = field(default_factory=dict)

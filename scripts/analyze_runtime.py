@@ -7,6 +7,7 @@ import yaml
 from memscope.parsers.config_loader import load_config
 from memscope.report.json_reporter import write_json_report
 from memscope.runtime.hooks import register_runtime_hooks
+from memscope.report.runtime_markdown_reporter import render_runtime_report
 from memscope.runtime.memory import (
     cuda_available, 
     get_device_name, 
@@ -17,6 +18,7 @@ from memscope.runtime.memory import (
 from memscope.runtime.tracer import RuntimeTracer
 from memscope.static.analyzer import analyze_static
 from memscope.models.toy_transformer import ToyTransformerLM
+from memscope.utils import format_bytes
 
 import torch
 import torch.nn as nn
@@ -66,6 +68,7 @@ def main():
     steps = int(runtime_cfg.get("steps", 1))
     lr = float(runtime_cfg.get("lr", 1e-4))
     seed = int(runtime_cfg.get("seed", 42))
+    top_k = int(runtime_cfg.get("top_k", 10))
 
     # 设置随机种子，保证实验可复现
     torch.manual_seed(seed)
@@ -97,7 +100,13 @@ def main():
 
     # 【关键】注册 Hooks
     # 这行代码执行后，模型的所有 forward/backward 过程都会被 tracer 记录
-    handles = register_runtime_hooks(model, tracer)
+    handles = register_runtime_hooks(
+        model,
+        tracer,
+        hook_modules=True,
+        hook_output_grads=True,
+        hook_param_grads=True,
+    )
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -120,32 +129,28 @@ def main():
         # --- 1. Step 开始 ---
         synchronize_if_needed(device) # 同步 GPU，确保读数准确
         before_step = memory_stats(device) # 记录步前显存
-        tracer.log_event(
-            event_type="step", 
-            module="train_step", 
-            phase="step_start", 
-            before=before_step, 
-            after=before_step, 
-            inputs=input_ids, 
-            notes="training step start", 
+        tracer.record_step_boundary(
+            phase="step_start",
+            before=before_step,
+            after=before_step,
+            inputs=input_ids,
+            notes="training step start",
         )
 
         optimizer.zero_grad(set_to_none=True)
 
         # --- 2. 前向传播 (Forward) ---
         synchronize_if_needed(device)
-        before_fwd = memory_stats(device)
+        before_forward = memory_stats(device)
         logits = model(input_ids) # <--- 这里会触发 register_forward_hook
         synchronize_if_needed(device)
-        after_fwd = memory_stats(device)
-        tracer.log_event(
-            event_type="step", 
-            module="train_step", 
-            phase="forward_end", 
-            before=before_fwd, 
-            after=after_fwd, 
-            outputs=logits, 
-            notes="full forward done", 
+        after_forward = memory_stats(device)
+        tracer.record_step_boundary(
+            phase="forward_end",
+            before=before_forward,
+            after=after_forward,
+            outputs=logits,
+            notes="full forward done",
         )
 
         # --- 3. 计算 Loss ---
@@ -153,18 +158,16 @@ def main():
 
         # --- 4. 反向传播 (Backward) ---
         synchronize_if_needed(device)
-        before_bwd = memory_stats(device)
+        before_backward = memory_stats(device)
         loss.backward()
         synchronize_if_needed(device)
-        after_bwd = memory_stats(device)
-        tracer.log_event(
-            event_type="step", 
-            module="train_step", 
-            phase="backward_end", 
-            before=before_bwd, 
-            after=after_bwd, 
-            outputs=loss, 
-            notes="full backward done", 
+        after_backward = memory_stats(device)
+        tracer.record_step_boundary(
+            phase="backward_end",
+            before=before_backward,
+            after=after_backward,
+            outputs=loss,
+            notes=f"full backward done; loss={loss.item():.6f}",
         )
 
         # --- 5. 优化器步进 (Optimizer Step) ---
@@ -173,26 +176,22 @@ def main():
         optimizer.step()
         synchronize_if_needed(device)
         after_optim = memory_stats(device)
-        tracer.log_event(
-            event_type="step", 
-            module="train_step", 
-            phase="optimizer_step_end", 
-            before=before_optim, 
-            after=after_optim, 
-            notes="optimizer step done"
+        tracer.record_step_boundary(
+            phase="optimizer_step_end",
+            before=before_optim,
+            after=after_optim,
+            notes="optimizer step done",
         )
 
         # --- 6. Step 结束总结 ---
         synchronize_if_needed(device)
-        after_step = memory_stats(device)
-        tracer.log_event(
-            event_type="step", 
-            module="train_step", 
-            phase="step_end", 
-            before=before_step, 
-            after=after_step, 
-            outputs=loss.detach(), 
-            notes=f"loss={loss.item():.6f}", 
+        end_step = memory_stats(device)
+        tracer.record_step_boundary(
+            phase="step_end",
+            before=before_step,
+            after=end_step,
+            outputs=loss.detach(),
+            notes="training step end",
         )
 
     for h in handles:
@@ -217,19 +216,38 @@ def main():
             "peak_diff_bytes": float(tracer._peak_allocated - static_peak), 
             "peak_diff_ratio": float((tracer._peak_allocated - static_peak) / static_peak) if static_peak > 0 else 0.0,
         },
+        top_k=top_k,
     )
 
     runtime_json_path = outdir / "runtime_report.json"
+    runtime_md_path = outdir / "runtime_report.md"
+
     write_json_report(runtime_report, runtime_json_path)
+    runtime_md_path.write_text(render_runtime_report(runtime_report), encoding="utf-8")
 
     print("MemScope Runtime Report")
-    print(f"Device: {device}")
-    print(f"Device name: {get_device_name(device)}")
-    print(f"Peak allocated: {runtime_report.peak.memory_bytes} bytes")
-    print(f"Peak reserved:  {runtime_report.peak.reserved_bytes} bytes")
+    print(f"Device:         {device}")
+    print(f"Device name:    {get_device_name(device)}")
+    print(f"Peak allocated: {format_bytes(runtime_report.peak.memory_bytes)}")
+    print(f"Peak reserved:  {format_bytes(runtime_report.peak.reserved_bytes)}")
     print(f"Peak phase:     {runtime_report.peak.phase}")
     print(f"Peak module:    {runtime_report.peak.module}")
+    print("")
+
+    print(f"Top {len(runtime_report.top_events)} events by allocated-after:")
+    for i, ev in enumerate(runtime_report.top_events, 1):
+        print(
+            f"{i:>2}. step={ev.step} "
+            f"type={ev.event_type} "
+            f"phase={ev.phase} "
+            f"module={ev.module} "
+            f"after={format_bytes(ev.mem_allocated_after)} "
+            f"delta={format_bytes(ev.delta_allocated)}"
+        )
+
+    print("")
     print(f"Saved runtime report to: {runtime_json_path}")
+    print(f"Saved runtime markdown to: {runtime_md_path}")
 
 
 if __name__ == "__main__":

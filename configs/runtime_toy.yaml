@@ -2,3 +2,4 @@ device: cuda
 steps: 1
 lr: 1.0e-4
 seed: 42
+top_k: 10

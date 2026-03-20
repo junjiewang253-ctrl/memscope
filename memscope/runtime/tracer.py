@@ -1,79 +1,88 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 from memscope.schemas.report import (
-    RuntimeEvent,
-    RuntimePeak, 
-    RuntimeReport, 
-    RuntimeTensorInfo, 
+    RuntimeEvent,      # 单个事件的 schema
+    RuntimePeak,       # 峰值记录的 schema
+    RuntimeReport,     # 最终报告的 schema
+    RuntimeTensorInfo, # Tensor 信息的 schema
 )
 from memscope.runtime.memory import memory_stats
 
-try: 
+try:
     import torch
-except ImportError:
+except ImportError:  # pragma: no cover
     torch = None
 
+
 def _dtype_str(t) -> str:
-    """
-    将 PyTorch 的 dtype (如 torch.float32) 转换为纯字符串 ("float32")。
-    """
     if torch is None:
         return "unknown"
     return str(t.dtype).replace("torch.", "")
 
-def _num_bytes(t) -> int:
-    """
-    计算一个 Tensor 占用的显存字节数。
-    公式：元素个数 (numel) × 每个元素的字节大小 (element_size)
-    例如：形状 [2, 3] 的 float32 张量 = 6 个元素 × 4 字节 = 24 字节
-    """
+
+def _tensor_bytes(t) -> int:
     if torch is None:
         return 0
     return int(t.numel() * t.element_size())
 
+
 def _flatten_tensors(obj: Any) -> List[Any]:
     """
-    递归遍历任意嵌套结构 (list/tuple/dict)，提取出所有的 torch.Tensor 对象。
+    递归遍历任意嵌套结构（list/tuple/dict），提取出所有的 torch.Tensor。
+    因为模型的输入/输出/梯度往往是复杂的嵌套字典或列表。
     """
-    # 情况 1: 如果本身就是 Tensor，直接放入列表
     if torch is not None and isinstance(obj, torch.Tensor):
         return [obj]
-    # 情况 2: 如果是列表或元组，遍历每个元素并递归调用
+
     if isinstance(obj, (list, tuple)):
         out = []
         for x in obj:
             out.extend(_flatten_tensors(x))
         return out
-    # 情况 3: 如果是字典，只遍历值 (values)，忽略键 (keys)
+
     if isinstance(obj, dict):
         out = []
         for _, v in obj.items():
             out.extend(_flatten_tensors(v))
         return out
+
     return []
+
 
 def tensor_to_info(t, name: str = "") -> RuntimeTensorInfo:
     """
-    将一个 Tensor 对象转换为 RuntimeTensorInfo 数据类实例。
+    将一个 Tensor 对象转换为轻量级的 RuntimeTensorInfo 数据类。
+    这样做的目的是避免在报告中保存巨大的 Tensor 数据本身，只保存元数据（形状、类型等）。
     """
     return RuntimeTensorInfo(
-        name=name, 
-        shape=list(t.shape), 
-        dtype=_dtype_str(t), 
-        device=str(t.device), 
-        # getattr(obj, attr, default): 安全获取属性，如果没有 requires_grad 则默认为 False
-        requires_grad=bool(getattr(t, "requires_grad", False)), 
-        bytes=_num_bytes(t), 
+        name=name,
+        shape=list(t.shape),
+        dtype=_dtype_str(t),
+        device=str(t.device),
+        requires_grad=bool(getattr(t, "requires_grad", False)),
+        bytes=_tensor_bytes(t),
     )
 
+
 class RuntimeTracer:
+    """
+    运行时追踪器：
+    - 保存事件序列
+    - 保存模块 forward_pre 时的显存快照
+    - 维护全局 peak
+    """
+
     def __init__(self, device: str, step: int = 0):
         self.device = device
         self.step = step
         self.events: List[RuntimeEvent] = []
+
+        # module_name -> memory_stats snapshot
+        # 【关键逻辑】用于匹配 forward_pre 和 forward 的临时缓存
+        # Key: 模块名称, Value: forward_pre 时的显存快照
+        self.module_pre_stats: Dict[str, dict] = {}
 
         self._peak_allocated = 0
         self._peak_reserved = 0
@@ -82,14 +91,39 @@ class RuntimeTracer:
         self._peak_step = 0
 
     def set_step(self, step: int) -> None:
+        """更新当前的训练步数 (step)，用于标记事件发生的时间点。"""
         self.step = step
+
+    def capture_stats(self) -> dict:
+        """调用底层工具获取当前时刻的显存快照。"""
+        return memory_stats(self.device)
+
+    def remember_module_pre(self, module_name: str, stats: dict) -> None:
+        """
+        在模块 forward 执行前，暂存显存状态。
+        这是为了稍后在 forward 结束后，计算该模块单独消耗了多少显存。
+        """
+        self.module_pre_stats[module_name] = stats
+
+    def pop_module_pre(self, module_name: str) -> Optional[dict]:
+        """
+        取出并删除之前暂存的显存状态。
+        如果没找到（可能出错或未注册 pre-hook），返回 None。
+        """
+        return self.module_pre_stats.pop(module_name, None)
+
+    def make_tensor_infos(self, obj: Any) -> List[RuntimeTensorInfo]:
+        """组合工具：先展平对象，再批量转换为 Info 对象。"""
+        tensors = _flatten_tensors(obj)
+        return [tensor_to_info(t) for t in tensors]
 
     def _update_peak(self, module: str, phase: str, stats_after: dict) -> None:
         """
-        检查当前显存是否打破了历史纪录。如果是，更新峰值信息。
+        检查当前显存是否打破了历史纪录。
+        如果是，则更新内部的峰值变量。
         """
-        allocated = stats_after["allocated"]
-        reserved = stats_after["reserved"]
+        allocated = int(stats_after.get("allocated", 0))
+        reserved = int(stats_after.get("reserved", 0))
 
         if allocated >= self._peak_allocated:
             self._peak_allocated = allocated
@@ -98,77 +132,195 @@ class RuntimeTracer:
             self._peak_module = module
             self._peak_step = self.step
 
-    def make_tensor_infos(self, obj: Any) -> List[RuntimeTensorInfo]:
-        """
-        利用前面的 _flatten_tensors 和 tensor_to_info，一键转换复杂对象。
-        """
-        tensors = _flatten_tensors(obj)
-        return [tensor_to_info(t) for t in tensors]
-    
-    def log_event(
-            self, 
-            *,  # 强制后面的参数必须使用关键字传递 (如 log_event(event_type="...", ...))，提高可读性
-            event_type: str, 
-            module: str, 
-            phase: str, 
-            before: Optional[dict] = None, 
-            after: Optional[dict] = None, 
-            inputs: Optional[Any] = None, 
-            outputs: Optional[Any] = None, 
-            grads: Optional[Any] = None, 
-            notes: str = "", 
-    ) -> None:
-        # 1. 获取显存快照
-        # 如果调用者没传 before/after，就自动调用 memory_stats 获取当前状态
-        before = before or memory_stats(self.device)
-        after = after or memory_stats(self.device)
-
-        # 2. 构建事件对象
-        event = RuntimeEvent(
-            event_type=event_type, 
-            module=module, 
-            phase=phase, 
-            step=self.step, 
-            mem_allocated_before=before["allocated"], 
-            mem_allocated_after=after["allocated"], 
-            mem_reserved_before=before["reserved"], 
-            mem_reserved_after=after["reserved"], 
-            max_mem_allocated=after["max_allocated"], 
-            delta_allocated=after["allocated"] - before["allocated"], 
-
-            # 3. 转换输入输出张量
-            inputs=self.make_tensor_infos(inputs) if inputs is not None else [], 
-            outputs=self.make_tensor_infos(outputs) if outputs is not None else [], 
-            grads=self.make_tensor_infos(grads) if grads is not None else [],
-            notes=notes, 
-        )
+    def record_event(
+        self,
+        *,                # 强制使用关键字参数调用，提高可读性
+        event_type: str,  # 事件类型：'step', 'module', 'tensor_grad'
+        module: str,      # 涉及的模块名
+        phase: str,       # 阶段：'forward_pre', 'forward', 'backward'
+        before: Optional[dict] = None, # 之前的显存快照
+        after: Optional[dict] = None,  # 之后的显存快照
+        inputs: Optional[Any] = None,  # 输入数据
+        outputs: Optional[Any] = None, # 输出数据
+        grads: Optional[Any] = None,   # 梯度数据
+        notes: str = "",
+    ) -> RuntimeEvent:
         
-        # 4. 存入列表
+        # 如果没有传入快照，就现场抓一个（作为兜底策略）
+        before = before or self.capture_stats()
+        after = after or self.capture_stats()
+
+        event = RuntimeEvent(
+            event_type=event_type,
+            module=module,
+            phase=phase,
+            step=self.step,
+            mem_allocated_before=int(before.get("allocated", 0)),
+            mem_allocated_after=int(after.get("allocated", 0)),
+            mem_reserved_before=int(before.get("reserved", 0)),
+            mem_reserved_after=int(after.get("reserved", 0)),
+            max_mem_allocated=int(after.get("max_allocated", 0)),
+            max_mem_reserved=int(after.get("max_reserved", 0)),
+            # 计算差值：这是分析显存泄漏或突增的关键指标
+            delta_allocated=int(after.get("allocated", 0) - before.get("allocated", 0)),
+            delta_reserved=int(after.get("reserved", 0) - before.get("reserved", 0)),
+            # 转换 Tensor 数据为元数据
+            inputs=self.make_tensor_infos(inputs) if inputs is not None else [],
+            outputs=self.make_tensor_infos(outputs) if outputs is not None else [],
+            grads=self.make_tensor_infos(grads) if grads is not None else [],
+            notes=notes,
+        )
+
+        # 1. 存入历史列表
         self.events.append(event)
-
-        # 5. 更新峰值记录
+        # 2. 检查是否更新全局峰值
         self._update_peak(module, phase, after)
+        return event
 
-    def build_report(self, metadata: Optional[dict] = None, comparisons: Optional[dict] = None) -> RuntimeReport:
+    def record_step_boundary(
+        self,
+        *,
+        phase: str,
+        module: str = "train_step",
+        before: Optional[dict] = None,
+        after: Optional[dict] = None,
+        inputs: Optional[Any] = None,
+        outputs: Optional[Any] = None,
+        notes: str = "",
+    ) -> RuntimeEvent:
+        """记录一个完整训练步骤（Step）的开始或结束。"""
+        return self.record_event(
+            event_type="step",
+            module=module,
+            phase=phase,
+            before=before,
+            after=after,
+            inputs=inputs,
+            outputs=outputs,
+            notes=notes,
+        )
+
+    def record_module_forward_pre(
+        self,
+        *,
+        module: str,
+        inputs: Any,
+        before: dict,
+        notes: str = "",
+    ) -> RuntimeEvent:
         """
-        将收集到的所有事件和峰值信息打包成最终的 RuntimeReport 对象。
+        在模块 forward 执行前调用。
+        关键动作：调用 remember_module_pre 保存状态，以便后续计算增量。
         """
+        self.remember_module_pre(module, before) # 保存现场
+        return self.record_event(
+            event_type="module",
+            module=module,
+            phase="forward_pre",
+            before=before,
+            after=before,
+            inputs=inputs,
+            notes=notes or "before forward",
+        )
+
+    def record_module_forward(
+        self,
+        *,
+        module: str,
+        inputs: Any,
+        outputs: Any,
+        after: dict,
+        notes: str = "",
+    ) -> RuntimeEvent:
+        """
+        在模块 forward 执行后调用。
+        关键动作：弹出之前保存的 pre 状态作为 'before'，从而精确计算该模块的显存增量。
+        """
+
+        # 尝试获取 pre 状态；如果丢失（异常），则用当前状态作为 before（差值为 0，保稳）
+        before = self.pop_module_pre(module) or after
+
+        return self.record_event(
+            event_type="module",
+            module=module,
+            phase="forward",
+            before=before,
+            after=after,
+            inputs=inputs,
+            outputs=outputs,
+            notes=notes or "after forward",
+        )
+
+    def record_tensor_grad(
+        self,
+        *,
+        module: str,
+        grad: Any,
+        before: Optional[dict] = None,
+        after: Optional[dict] = None,
+        notes: str = "",
+    ) -> RuntimeEvent:
+        """
+        在反向传播时，通过 Tensor Hook 捕获梯度。
+        """
+        return self.record_event(
+            event_type="tensor_grad",
+            module=module,
+            phase="backward",
+            before=before,
+            after=after,
+            grads=grad,
+            notes=notes or "tensor grad captured",
+        )
+
+    def top_events_by_allocated_after(self, top_k: int = 10) -> List[RuntimeEvent]:
+        """
+        找出显存占用绝对值最大的事件。
+        排序优先级：当前分配量 > 历史最大分配量 > 增量
+        """
+        return sorted(
+            self.events,
+            key=lambda e: (e.mem_allocated_after, e.max_mem_allocated, e.delta_allocated),
+            reverse=True,
+        )[:top_k]
+
+    def top_events_by_delta_allocated(self, top_k: int = 10) -> List[RuntimeEvent]:
+        """
+        找出显存增量（跳变）最大的事件。
+        这通常对应于大型算子（如 Attention 矩阵乘法）的执行瞬间。
+        """
+        return sorted(
+            self.events,
+            key=lambda e: e.delta_allocated,
+            reverse=True,
+        )[:top_k]
+
+    def build_report(
+        self,
+        metadata: Optional[dict] = None,
+        comparisons: Optional[dict] = None,
+        top_k: int = 10,
+    ) -> RuntimeReport:
+        """
+        打包所有数据，生成最终的 RuntimeReport 对象。
+        """
+        # 1. 封装峰值信息
         peak = RuntimePeak(
-            phase=self._peak_phase, 
-            module=self._peak_module, 
-            step=self._peak_step, 
-            memory_bytes=self._peak_allocated, 
+            phase=self._peak_phase,
+            module=self._peak_module,
+            step=self._peak_step,
+            memory_bytes=self._peak_allocated,
             reserved_bytes=self._peak_reserved,
         )
+
+        # 2. 获取 Top 事件（按显存占用排序）
+        top_events = self.top_events_by_allocated_after(top_k=top_k)
+
+        # 3. 组装报告
         return RuntimeReport(
-            runtime_trace=self.events, 
-            peak=peak,
-            metadata=metadata or {}, 
-            comparisons=comparisons or {}
+            runtime_trace=self.events,   # 完整的时间线
+            peak=peak,                   # 峰值摘要
+            top_events=top_events,       # 关键事件摘要
+            metadata=metadata or {},     # 额外元数据（如模型名、GPU 型号）
+            comparisons=comparisons or {}, # 与静态分析的对比数据
         )
-    
-    def to_dict(self, report: RuntimeReport) -> dict:
-        """
-        利用 dataclasses.asdict 将报告对象转换为普通字典，方便保存为 JSON。
-        """
-        return asdict(report)
