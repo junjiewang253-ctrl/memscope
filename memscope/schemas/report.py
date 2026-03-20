@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 from .op import OpRecord
 
 @dataclass
@@ -49,18 +49,60 @@ class StaticReport:
     metadata: Dict[str, str] = field(default_factory=dict)
 
 @dataclass
+class RuntimeTensorInfo:
+    """
+    运行时张量快照：用于描述在某个时间点，Hook捕获到的具体Tensor信息
+    """
+    name: str = ""                                  # 张量名称 (如 "hidden_states", "grad_weight")
+    shape: List[int] = field(default_factory=list)  # 真实 Shape (如 [4, 2048, 4096])
+    dtype: str = ""                                 # 真实数据类型 (如 "torch.bfloat16")
+    device: str = ""                                # 设备 (如 "cuda:0")
+    requires_grad: bool = False                     # 是否需要梯度 (决定反向传播时是否占显存)
+    bytes: int = 0                                  # 占用字节数 (shape 元素个数 * dtype 字节大小)
+
+@dataclass
 class RuntimeEvent:
     """
-    运行时显存事件。
-    对应 PyTorch 等框架中某个 Module 执行前后的显存状态。
+    运行时事件： 每一次 Hook 触发（如进入一个 Module 的前向传播），就会生成一个这样的事件
+    记录训练过程中每一个关键节点的显存变化快照
+    - module forward_pre
+    - module forward
+    - tensor backward grad
+    - step boundary
     """
-    module: str
-    phase: str
-    mem_allocated_before: int
-    mem_allocated_after: int
-    delta: int
-    inputs: List[dict] = field(default_factory=list)
-    outputs: List[dict] = field(default_factory=list)
+    event_type: str       # 事件类型：如 "forward_pre", "forward_post", "backward", "optimizer_step"
+    module: str           # 触发事件的模块名：如 "model.layers.0.self_attn"
+    phase: str            # 阶段：如 "forward", "backward"
+    step: int = 0         # 当前的训练步数 (Global Step)
+
+    # --- 显存水位的“前后对比” (核心逻辑) ---
+    # 通过对比 Before 和 After，我们可以精确计算出“这个算子到底吃掉了多少显存”
+    mem_allocated_before: int = 0  # 事件发生前，PyTorch 已分配的显存
+    mem_allocated_after: int = 0   # 事件发生后，PyTorch 已分配的显存
+    mem_reserved_before: int = 0   # 事件发生前，PyTorch 向驱动申请的保留显存 (包含碎片)
+    mem_reserved_after: int = 0    # 事件发生后，PyTorch 向驱动申请的保留显存
+    
+    # --- 衍生指标 (自动计算) ---
+    max_mem_allocated: int = 0     # 历史最大分配显存 (可用于追踪全局峰值)
+    delta_allocated: int = 0       # 净增量 = allocated_after - allocated_before
+
+    # 记录该事件涉及的具体 Tensor 信息，用于深度分析“是谁占用了显存”
+    inputs: List[RuntimeTensorInfo] = field(default_factory=list)  # 输入张量列表
+    outputs: List[RuntimeTensorInfo] = field(default_factory=list) # 输出张量列表
+    grads: List[RuntimeTensorInfo] = field(default_factory=list)   # 涉及的梯度张量列表
+
+    notes: str = "" # 备注：可记录特殊情况，如 "Triggered Activation Checkpointing"
+
+@dataclass
+class RuntimePeak:
+    """
+    峰值快照
+    """
+    phase: str = ""
+    module: str = ""
+    step: int = 0
+    memory_bytes: int = 0
+    reserved_bytes: int = 0
 
 @dataclass
 class RuntimeReport:
@@ -72,8 +114,8 @@ class RuntimeReport:
     # 时间序列的事件列表: 按时间顺序记录所有 RuntimeEvent, 可以画出 "显存随时间变化曲线"，直观看到哪里出现了尖峰
     runtime_trace: List[RuntimeEvent] = field(default_factory=list)
 
-    peak_memory_bytes: int = 0
-    peak_stage: str = ""
+    peak: RuntimePeak = field(default_factory=dict)
 
     # 运行时环境元数据, 示例：{"gpu_type": "A100", "cuda_version": "12.1", "pytorch_version": "2.5"}
-    meta_data: Dict[str, str] = field(default_factory=dict)
+    metadata: Dict[str, str] = field(default_factory=dict)
+    comparisons: Dict[str, float] = field(default_factory=dict)
