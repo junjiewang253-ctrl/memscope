@@ -3,3 +3,17 @@ steps: 1
 lr: 1.0e-4
 seed: 42
 top_k: 10
+
+enable_profiler: true
+enable_memory_snapshot: true
+
+profiler_record_shapes: true
+profiler_profile_memory: true
+profiler_with_stack: false
+profiler_with_flops: false
+
+snapshot_max_entries: 100000
+
+trace_filename: trace.json
+snapshot_filename: memory_snapshot.pickle
+compare_filename: compare_report.md

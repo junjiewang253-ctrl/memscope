@@ -87,4 +87,3 @@ Important notes:
 
 - If you want cleaner measurements, run with a fresh process and keep `steps: 1` while iterating.
 - When comparing runs, watch both `allocated` and `reserved`. A change that reduces `allocated` but increases `reserved` can still matter for long runs.
-```

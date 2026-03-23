@@ -48,7 +48,7 @@ def reset_peak_memory_stats(device: str) -> None:
     if not cuda_available():
         return
     dev = torch.device(device)
-    torch.cuda.reset_accumulated_memory_stats(dev)
+    torch.cuda.reset_peak_memory_stats(dev)
 
 def synchronize_if_needed(device: str) -> None:
     """
