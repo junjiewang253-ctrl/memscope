@@ -1,150 +1,90 @@
 ```markdown
-# MemScope (Phase 1) — Static GPU Memory Estimator
+# MemScope — Phase 2 (Runtime Tracing MVP)
 
-MemScope is a **static (rule-based) GPU memory estimator** for LLaMA-like transformer training.  
-Given a model/training config, it produces a **memory breakdown** (weights/grad/optimizer/activations/temp/persistent) and an **operator-level report** with shapes, dtypes, byte sizes, and formulas.
+Phase 2 focuses on **measuring real GPU memory during a training step**.  
+Instead of estimating from formulas, it runs a small model, hooks into forward/backward, and writes a `runtime_report.json` you can use to answer:
 
-> Status: **Phase 1 (Static Analysis MVP)** — produces `static_report.json` and `static_report.md`.
+- peak memory happens **when** (forward / backward / optimizer step)
+- memory jumps happen **where** (which module / boundary event)
+- the biggest tensors are **what** (outputs / grads by shape + dtype + bytes)
+- how `allocated` compares to `reserved` (allocator cache / fragmentation signals)
 
----
+This phase is intentionally simple: module-level sampling + tensor grad hooks. It’s not a full CUDA allocator trace.
 
-## Features (Phase 1)
+## Quick start
 
-- **One-command static analysis** from a JSON config
-- **Summary memory breakdown**
-  - `param_count`
-  - `weight_memory_bytes`
-  - `grad_memory_bytes`
-  - `optimizer_memory_bytes`
-  - `activation_memory_bytes`
-  - `temporary_memory_bytes`
-  - `persistent_memory_bytes`
-  - `peak_memory_bytes` and `peak_stage`
-- **Operator-level records**
-  - `name`, `category`, `phase`
-  - `inputs[]` / `outputs[]`: `shape`, `dtype`, `bytes`, `name`
-  - `memory_bytes`, `persistent`, `formula`, `notes`, `extra`
-- **Report formats**
-  - Console
-  - JSON (`static_report.json`) — source of truth for downstream tooling
-  - Markdown (`static_report.md`) — human-readable snapshot
+### 1) Pick a config
+Model + train config (JSON), e.g.:
 
----
+- `configs/llama_runtime_toy.json`
 
-## Quick Start
+Runtime environment config (YAML), e.g.:
 
-### 1) Create/choose a config
-Put a config JSON under `configs/`, for example:
+- `configs/runtime_toy.yaml`
 
-- `configs/llama_toy.json`
+Example:
 
-### 2) Run static analysis
 ```bash
-python scripts/analyze_static.py --config configs/llama_toy.json
+python scripts/analyze_runtime.py \
+  --config configs/llama_runtime_toy.json \
+  --runtime-config configs/runtime_toy.yaml \
+  --outdir outputs
 ```
 
-### 3) Outputs
-By default the script writes reports to `outputs/`:
+### 2) Outputs
 
-- `outputs/static_report.json`
-- `outputs/static_report.md`
+- `outputs/runtime_report.json` — source of truth for analysis/visualization
+- `outputs/runtime_report.md` — quick human-readable snapshot
 
----
+## What gets traced
 
-## Output Schema (StaticReport)
+During each step the script records boundary events:
 
-### Top-level
-- `summary`: global memory totals and peak info
-- `operators`: list of operator/module records (static estimates)
-- `metadata`: run metadata (e.g., mode/model_type/dtype)
+- `step_start`
+- `forward_end`
+- `backward_end`
+- `optimizer_step_end`
+- `step_end`
 
-### Example (abridged)
-```json
-{
-  "summary": {
-    "param_count": 375414784,
-    "weight_memory_bytes": 750780416,
-    "grad_memory_bytes": 750829568,
-    "optimizer_memory_bytes": 6006243328,
-    "activation_memory_bytes": 786432000,
-    "temporary_memory_bytes": 819462144,
-    "persistent_memory_bytes": 8507853312,
-    "peak_memory_bytes": 9327315456,
-    "peak_stage": "optimizer_step"
-  },
-  "operators": [
-    {
-      "name": "embedding",
-      "category": "embedding",
-      "phase": "forward",
-      "inputs": [
-        {"name":"token_ids","shape":[1,2048],"dtype":"int8","bytes":2048}
-      ],
-      "outputs": [
-        {"name":"embeddings","shape":[2048,1,8192],"dtype":"bf16","bytes":33554432}
-      ],
-      "memory_bytes": 33554432,
-      "persistent": false,
-      "formula": "2BSH",
-      "notes": "BF16 embeddings",
-      "extra": {}
-    }
-  ],
-  "metadata": {
-    "mode": "static",
-    "model_type": "llama",
-    "dtype": "bf16"
-  }
-}
+It also records:
+
+- `module` events via `forward_pre_hook` and `forward_hook` for “interesting” modules (Embedding / Linear / RMSNorm / Attention / MLP / Block / LM head, etc.)
+- `tensor_grad` events by registering hooks on module outputs (and on parameters) to capture gradient tensor metadata
+
+For every event we save CUDA memory stats:
+
+- `mem_allocated_before/after`
+- `mem_reserved_before/after`
+- `delta_allocated/delta_reserved`
+- `max_mem_allocated/max_mem_reserved`
+
+Plus lightweight tensor metadata:
+
+- `shape`, `dtype`, `device`, `requires_grad`, `bytes`
+
+## How to read `runtime_report.json`
+
+Top-level fields:
+
+- `runtime_trace`: ordered event list for the whole step
+- `peak`: peak `allocated` and `reserved` observed at event boundaries
+- `top_events`: events with the highest `mem_allocated_after` (useful for “what was happening near the peak”)
+- `metadata`: device / dtype / optimizer / etc.
+- `comparisons`: optional (only used if you also run static; safe to ignore in Phase 2)
+
+Important notes:
+
+- Peak is computed from the events we sample. If a big temporary allocation happens *inside* a module and is freed before the module hook returns, we may miss that spike.
+- `reserved` can stay high even if `allocated` drops; that’s expected with PyTorch’s caching allocator.
+
+## Limitations (by design)
+
+- Not operator-level: we trace module boundaries, not every matmul/softmax kernel.
+- Not a full “peak composition”: we can tell you where the peak occurred and what large tensors exist, but we don’t reconstruct exact live tensor sets at the peak.
+- Numbers are allocator-level (`torch.cuda.memory_allocated/reserved`), not raw CUDA allocations.
+
+## Tips
+
+- If you want cleaner measurements, run with a fresh process and keep `steps: 1` while iterating.
+- When comparing runs, watch both `allocated` and `reserved`. A change that reduces `allocated` but increases `reserved` can still matter for long runs.
 ```
-
----
-
-## Project Structure (Phase 1)
-
-Typical layout:
-
-- `scripts/`
-  - `analyze_static.py` — CLI entrypoint for static estimation
-- `memscope/`
-  - `parsers/`
-    - `config_loader.py` — load/validate config JSON
-  - `schemas/`
-    - `config.py` — config dataclasses
-    - `op.py` — `OpRecord` and tensor record schema
-    - `report.py` — `StaticReport`, `Summary`, metadata schema
-  - `static/`
-    - `shape_infer.py` — static shape inference + op generation
-    - `formulas.py` — byte formulas and helpers
-  - `report/`
-    - `console_reporter.py`
-    - `json_reporter.py`
-    - `markdown_reporter.py`
-
-> The JSON report is intended to be stable and machine-consumable; Markdown/console are views.
-
----
-
-## Assumptions & Limitations (Phase 1)
-
-This version is **static** and **rule-based**. It does **not** measure real runtime allocations.
-
-Common limitations:
-- Memory is estimated from shapes/dtypes and simplified lifecycle assumptions.
-- Peak stage is identified at a coarse granularity (e.g., `"optimizer_step"`), and may not match exact runtime peaks.
-- Operator list may represent **aggregated** operations (some formulas may include an `L` multiplier for number of layers) rather than a fully unrolled per-layer trace.
-
----
-
-## Roadmap
-
-### Phase 2 — Runtime Tracing (Validation)
-- Hook into a real training step (or a forward/backward pass)
-- Record runtime memory (`torch.cuda.memory_allocated()` / peak stats)
-- Produce `runtime_report.json`
-- Compare static vs runtime errors and calibrate rules
-
-### Phase 3 — Peak Composition / Memory Snapshots
-- Identify **what tensors contribute to peak**
-- Optional integration with CUDA memory snapshots / profiler traces
-- Better lifecycle modeling and per-stage/per-op peak breakdown
