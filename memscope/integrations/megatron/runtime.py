@@ -107,6 +107,7 @@ class MemScopeMegatronRuntime:
             hook_modules=self.hook_modules, 
             hook_output_grads=self.hook_output_grads, 
             hook_param_grads=self.hook_param_grads, 
+            sync_on_module_hooks=self.sync_on_module_hooks
         )
 
     def start(self):
