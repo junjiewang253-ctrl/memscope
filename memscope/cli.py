@@ -35,5 +35,5 @@ def main():
 
     parser.print_help()
 
-if __name__() == "main":
+if __name__ == "main":
     main()
