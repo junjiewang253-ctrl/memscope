@@ -401,6 +401,7 @@ if getattr(args, "memscope", False):
 ```
 
 配置文件里只需要在 train.system 下(也就是例如14b.yaml的system: 下)增加类似下面的字段：
+```yaml
 memscope: true
 memscope_outdir: ${experiment.exp_dir}/memscope
 memscope_top_k: 20
@@ -413,11 +414,15 @@ memscope_profiler_ranks: [0]
 memscope_snapshot_ranks: [0]
 memscope_sync_on_step_boundaries: true
 memscope_sync_on_module_hooks: false
+```
 
 训练完成后，报告会输出到类似下面的目录：
+```text
 output_xxx/memscope/rank00000/runtime_report.json
 output_xxx/memscope/rank00000/runtime_report.md
+```
 如果是多卡训练，每个 rank 都会各自输出一个目录。
+
 
 ## 输出报告怎么看
 runtime report 里最重要的部分有四个：runtime_trace、peak、top_events、comparisons。
