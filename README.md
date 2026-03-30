@@ -432,7 +432,40 @@ peak 是当前 rank 的显存峰值快照。
 top_events 是按显存占用排序的关键事件摘要，通常很适合直接定位“谁最重”。
 comparisons 会给出 static estimate 和 runtime peak 的差异，方便判断静态模型是否过于保守，或者 runtime 是否出现了额外开销。
 
-## 后续计划
-接下来我会继续把这个项目往两个方向补强。一个方向是可视化，把 runtime report 直接渲染成更容易阅读的 HTML 页面；另一个方向是现在的静态显存估算公式偏保守估计，所以输出的结果会比动态分析的结果相差较多，建议先以动态报告为准，我后续会把 static estimator 做得更贴近真实的 Megatron 配置，尤其是对并行切分、激活生命周期和优化器状态的估算。
+## Runtime可视化( HTML 报告 )
+MemScope 在运行时会输出一份 runtime_report.json，里面是每个 step 边界、模块 forward、以及梯度 hook 的显存快照。为了更方便排查“台阶”和“峰值”，我们提供了一个离线的 HTML 可视化页面：把 JSON 丢进去就能生成一个自包含的报告网页（不依赖后端服务）。
+
+### 生成 HTML
+运行结束后（默认路径类似 memscope_outputs/rank00000/runtime_report.json），执行：
+```python
+python -m memscope.cli visualize-runtime \
+  --report memscope_outputs/rank00000/runtime_report.json
+```
+不传 --out 的话，会在同目录生成同名的 .html 文件，比如：
+```text
+memscope_outputs/rank00000/runtime_report.html
+```
+你也可以指定输出路径：
+```python
+python -m memscope.cli visualize-runtime \
+  --report memscope_outputs/rank00000/runtime_report.json \
+  --out /tmp/memscope_runtime.html
+```
+然后直接用浏览器打开这个 HTML 文件即可。
+
+### 页面里能看到什么
+HTML 报告主要包含几块内容：
+
+**概览卡片**：runtime 峰值（allocated / reserved）、静态估算峰值、以及静态 vs runtime 的差值（用来快速判断静态估算是否偏保守）。
+
+**Step-level memory timeline**: 按 step 边界事件画出的两条曲线, allocated_after（PyTorch 当前实际持有的显存）, reserved_after（caching allocator 预留的显存，包含缓存与碎片）, 这块特别适合看类似 “step0 optimizer 之后基线抬升” 这种台阶现象。
+
+**Phase summary**: 按 phase 聚合后的最大 allocated 水位（帮助确认峰值更偏 forward / backward / optimizer）。
+
+**Top events**: 按 mem_allocated_after 排序的事件列表（支持搜索过滤），用于快速定位“峰值发生在什么模块/什么 phase/哪个 step 附近”。
+
+**Module aggregate**: 对每个 module 的事件做聚合，包含 max_allocated_after 和 max_delta_allocated。当你想找“哪个模块 forward 后净增量最大”时，这张表比 top events 更直观。
+
+**补充说明**：Step-level timeline 展示的是“打点时刻的显存水位”。如果某个模块内部有短生命周期的临时显存尖峰（分配后在模块结束前释放），仅靠模块前后 hook 可能看不到完整尖峰；这种场景可以配合 profiler 或 memory snapshot 做更细粒度的归因。
 
 如果你对大模型训练显存分析、Megatron 训练调试或者 profiling 工具感兴趣，欢迎交流或提 issue。
